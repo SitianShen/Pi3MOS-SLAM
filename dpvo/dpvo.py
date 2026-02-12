@@ -13,9 +13,9 @@ from .patchgraph import PatchGraph
 from .utils import *
 
 from safetensors.torch import load_file
-from pi3.utils.basic import preprocess_tensor_for_pi3
-from pi3.utils.geometry import se3_inverse
-from pi3.models.pi3 import Pi3
+from Pi3MOS_SLAM.pi3.utils.basic import preprocess_tensor_for_pi3
+from Pi3MOS_SLAM.pi3.utils.geometry import se3_inverse
+from Pi3MOS_SLAM.pi3.models.pi3 import Pi3
 
 mp.set_start_method('spawn', True)
 
