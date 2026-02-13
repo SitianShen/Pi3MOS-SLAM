@@ -1,4 +1,0 @@
-# Sintel dataset calibration parameters
-# Format: fx fy cx cy
-# These are default values, actual values are loaded from each scene's calibration.txt
-740.25000  739.81651  422.58691  179.58716
