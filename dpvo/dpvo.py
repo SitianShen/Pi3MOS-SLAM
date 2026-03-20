@@ -295,11 +295,12 @@ class DPVO:
         net = torch.zeros(1, len(ii), self.DIM, **self.kwargs)
         coords = self.reproject(indicies=(ii, jj, kk))
 
-        with autocast(enabled=self.cfg.MIXED_PRECISION):
-            corr = self.corr(coords, indicies=(kk, jj))
-            ctx = self.imap[:,kk % (self.M * self.pmem)]
-            net, (delta, weight, _) = \
-                self.network.update(net, ctx, corr, None, ii, jj, kk)
+        with torch.no_grad():
+            with autocast(enabled=self.cfg.MIXED_PRECISION):
+                corr = self.corr(coords, indicies=(kk, jj))
+                ctx = self.imap[:,kk % (self.M * self.pmem)]
+                net, (delta, weight, _) = \
+                    self.network.update(net, ctx, corr, None, ii, jj, kk)
 
         return torch.quantile(delta.norm(dim=-1).float(), 0.5)
 
@@ -361,7 +362,7 @@ class DPVO:
             # ...unless they are being used for loop closure
             lc_edges = ((self.pg.jj - self.pg.ii) > 30) & (self.pg.jj > (self.n - self.cfg.OPTIMIZATION_WINDOW))
             to_remove = to_remove & ~lc_edges
-        self.remove_factors(to_remove, store=True)
+        self.remove_factors(to_remove, store=self.cfg.LOOP_CLOSURE)
 
     def __run_global_BA(self):
         """ Global bundle adjustment
@@ -385,11 +386,12 @@ class DPVO:
         with Timer("other", enabled=self.enable_timing):
             coords = self.reproject()
 
-            with autocast(enabled=True):
-                corr = self.corr(coords)
-                ctx = self.imap[:, self.pg.kk % (self.M * self.pmem)]
-                self.pg.net, (delta, weight, _) = \
-                    self.network.update(self.pg.net, ctx, corr, None, self.pg.ii, self.pg.jj, self.pg.kk)
+            with torch.no_grad():
+                with autocast(enabled=True):
+                    corr = self.corr(coords)
+                    ctx = self.imap[:, self.pg.kk % (self.M * self.pmem)]
+                    self.pg.net, (delta, weight, _) = \
+                        self.network.update(self.pg.net, ctx, corr, None, self.pg.ii, self.pg.jj, self.pg.kk)
 
             lmbda = torch.as_tensor([1e-4], device="cuda")
             weight = weight.float()
@@ -432,9 +434,14 @@ class DPVO:
         with torch.no_grad():
             with torch.amp.autocast('cuda', dtype=dtype):
                 pi3_output = self.pi3(images_tensor)
+        del images_tensor
 
         pi3_points = pi3_output['local_points'][0]
         pi3_confidences = pi3_output['conf'][0].squeeze(-1)  # [N, H, W]
+        dynamic_prob = pi3_output['dynamic_masks'][0].squeeze(-1)
+        Twc_pi3 = pi3_output['camera_poses'][0].clone()      # [N, 4, 4]
+        del pi3_output
+        torch.cuda.empty_cache()
 
         if self.is_initialized:
             s = self.estimate_scale(pi3_points, pi3_confidences, id_list)
@@ -446,7 +453,6 @@ class DPVO:
         pi3_points = pi3_points / s_safe
         pi3_depths = pi3_points[..., 2]
 
-        dynamic_prob = pi3_output['dynamic_masks'][0].squeeze(-1)
         pi3_depths_resized = self._resize_to_fmap(pi3_depths)
         pi3_confidences_resized = self._resize_to_fmap(pi3_confidences)
         dynamic_prob_resized = self._resize_to_fmap(dynamic_prob)
@@ -456,9 +462,6 @@ class DPVO:
 
         for n, fid in enumerate(id_list):
             self.pi3_dynamic_masks_[fid % self.pi3_mem] = dynamic_prob_resized[n]
-
-        # Align PI3 camera-to-world poses to DPVO frame so that the first frame matches DPVO's Tcw at id0
-        Twc_pi3 = pi3_output['camera_poses'][0]             # [N, 4, 4]
         
         id0 = int(id_list[0])
         Tcw_dpvo_0 = SE3(self.pg.poses_[id0]).matrix()      # [4, 4]
@@ -626,13 +629,14 @@ class DPVO:
 
         for i, dpvo_image in enumerate(self.dpvo_init_window):
 
-            with autocast(enabled=self.cfg.MIXED_PRECISION):
-                fmap, gmap, imap, patches, _, clr = \
-                    self.network.patchify(dpvo_image, pi3_dynamics[i], pi3_confidences[i],
-                        patches_per_image=self.cfg.PATCHES_PER_FRAME, 
-                        centroid_sel_strat=self.cfg.CENTROID_SEL_STRAT, 
-                        return_color=True,
-                        static_mask_thresh=self.cfg.STATIC_MASK_THRESH)
+            with torch.no_grad():
+                with autocast(enabled=self.cfg.MIXED_PRECISION):
+                    fmap, gmap, imap, patches, _, clr = \
+                        self.network.patchify(dpvo_image, pi3_dynamics[i], pi3_confidences[i],
+                            patches_per_image=self.cfg.PATCHES_PER_FRAME, 
+                            centroid_sel_strat=self.cfg.CENTROID_SEL_STRAT, 
+                            return_color=True,
+                            static_mask_thresh=self.cfg.STATIC_MASK_THRESH)
             
             pi3_pose = pi3_poses[i]  # [4, 4]
             self.pg.poses_[i] = self.convert_matrix_to_quat(pi3_pose)
@@ -664,6 +668,11 @@ class DPVO:
             
         for itr in range(12):
             self.update(cov=self.cfg.USE_COV_ADAPTIVE)
+
+        # Free init window GPU memory (no longer needed after initialization)
+        self.dpvo_init_window.clear()
+        self.intrinsic_init_window.clear()
+        torch.cuda.empty_cache()
 
     def estimate_K(self, pre_points):
         H, W = int(pre_points.shape[0]), int(pre_points.shape[1])
@@ -715,13 +724,14 @@ class DPVO:
             dynamic_mask_vis = pi3_dynamics[-1]
             confidence_vis = pi3_confidences[-1]
 
-            with autocast(enabled=self.cfg.MIXED_PRECISION):
-                fmap, gmap, imap, patches, _, clr = \
-                    self.network.patchify(dpvo_image, pi3_dynamics[-1], pi3_confidences[-1],
-                        patches_per_image=self.cfg.PATCHES_PER_FRAME, 
-                        centroid_sel_strat=self.cfg.CENTROID_SEL_STRAT,
-                        return_color=True,
-                        static_mask_thresh=self.cfg.STATIC_MASK_THRESH)
+            with torch.no_grad():
+                with autocast(enabled=self.cfg.MIXED_PRECISION):
+                    fmap, gmap, imap, patches, _, clr = \
+                        self.network.patchify(dpvo_image, pi3_dynamics[-1], pi3_confidences[-1],
+                            patches_per_image=self.cfg.PATCHES_PER_FRAME, 
+                            centroid_sel_strat=self.cfg.CENTROID_SEL_STRAT,
+                            return_color=True,
+                            static_mask_thresh=self.cfg.STATIC_MASK_THRESH)
 
             sampled_depths_cur = self._sample_at_patch_centers(patches, pi3_depths[-1])
             inv_depths_cur = (1.0 / sampled_depths_cur.clamp(min=1e-6))
@@ -750,6 +760,8 @@ class DPVO:
                 sampled_depths_f = self._sample_at_patch_centers(self.pg.patches_[fid].unsqueeze(0), depth_map_f)
                 inv_depths_f = (1.0 / sampled_depths_f.clamp(min=1e-6))
                 self.pg.prior_inv_depth_[fid] = inv_depths_f.view(-1, 1)
+
+            del pi3_poses, pi3_points, pi3_depths, pi3_confidences, pi3_dynamics
 
             if self.n > 1:
                 if self.cfg.MOTION_MODEL == 'DAMPED_LINEAR':
@@ -782,6 +794,8 @@ class DPVO:
 
         ### update state attributes ###
         self.tlist.append(tstamp)
+        if len(self.tlist) > 20:
+            self.tlist = self.tlist[-10:]
         self.pg.tstamps_[self.n] = self.counter
 
         self.pg.index_[self.n + 1] = self.n + 1

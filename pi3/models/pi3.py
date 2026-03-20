@@ -145,8 +145,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         B = BN // N
 
         final_output = []
-        intermediate_features = []
-        
+
         hidden = hidden.reshape(B*N, hw, -1)
 
         register_token = self.register_token.repeat(B, N, 1, 1).reshape(B*N, *self.register_token.shape[-2:])
@@ -159,13 +158,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             pos = self.position_getter(B * N, H//self.patch_size, W//self.patch_size, hidden.device)
 
         if self.patch_start_idx > 0:
-            # do not use position embedding for special tokens (camera and register tokens)
-            # so set pos to 0 for the special tokens
             pos = pos + 1
             pos_special = torch.zeros(B * N, self.patch_start_idx, 2).to(hidden.device).to(pos.dtype)
             pos = torch.cat([pos_special, pos], dim=1)
-       
-        for i in range(len(self.decoder)):
+
+        num_blocks = len(self.decoder)
+        for i in range(num_blocks):
             blk = self.decoder[i]
 
             if i % 2 == 0:
@@ -177,11 +175,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
             hidden = blk(hidden, xpos=pos)
 
-            # Collect features
-            feat = hidden.reshape(B, N, hw, -1)
-            intermediate_features.append(feat)
-            
-            if i+1 in [len(self.decoder)-1, len(self.decoder)]:
+            if i+1 in [num_blocks-1, num_blocks]:
                 final_output.append(hidden.reshape(B*N, hw, -1))
 
         return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B*N, hw, -1)
