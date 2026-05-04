@@ -8,6 +8,16 @@ from torchvision import transforms
 from plyfile import PlyData, PlyElement
 import numpy as np
 
+def tensor_to_numpy_safe(tensor):
+    return np.array(np.from_dlpack(tensor.detach().cpu().contiguous()), copy=True)
+
+def pil_to_tensor_safe(image):
+    array = np.asarray(image, dtype=np.float32)
+    if array.ndim == 2:
+        array = array[..., None]
+    tensor = torch.as_tensor(np.ascontiguousarray(array)).permute(2, 0, 1)
+    return tensor / 255.0
+
 def load_images_as_tensor(path='data/truck', interval=1, PIXEL_LIMIT=255000):
     """
     Loads images from a directory or video, resizes them to a uniform size,
@@ -63,14 +73,12 @@ def load_images_as_tensor(path='data/truck', interval=1, PIXEL_LIMIT=255000):
     # --- 3. Resize images and convert them to tensors in the [0, 1] range ---
     tensor_list = []
     # Define a transform to convert a PIL Image to a CxHxW tensor and normalize to [0,1]
-    to_tensor_transform = transforms.ToTensor()
-    
     for img_pil in sources:
         try:
             # Resize to the uniform target size
             resized_img = img_pil.resize((TARGET_W, TARGET_H), Image.Resampling.LANCZOS)
             # Convert to tensor
-            img_tensor = to_tensor_transform(resized_img)
+            img_tensor = pil_to_tensor_safe(resized_img)
             tensor_list.append(img_tensor)
         except Exception as e:
             print(f"Error processing an image: {e}")
@@ -95,7 +103,7 @@ def tensor_to_pil(tensor):
         PIL.Image: The converted PIL image.
     """
     if torch.is_tensor(tensor):
-        array = tensor.detach().cpu().numpy()
+        array = tensor_to_numpy_safe(tensor)
     else:
         array = tensor
 
@@ -204,8 +212,7 @@ def preprocess_tensor_for_pi3(tensor, PIXEL_LIMIT=255000):
     resized_img = pil_image.resize((TARGET_W, TARGET_H), Image.Resampling.LANCZOS)
     
     # Convert back to tensor
-    to_tensor_transform = transforms.ToTensor()
-    processed_tensor = to_tensor_transform(resized_img)
+    processed_tensor = pil_to_tensor_safe(resized_img)
     
     return processed_tensor
 
@@ -216,10 +223,10 @@ def write_ply(
     path='output.ply',
 ) -> None:
     if torch.is_tensor(xyz):
-        xyz = xyz.detach().cpu().numpy()
+        xyz = tensor_to_numpy_safe(xyz)
 
     if torch.is_tensor(rgb):
-        rgb = rgb.detach().cpu().numpy()
+        rgb = tensor_to_numpy_safe(rgb)
 
     if rgb is not None and rgb.max() > 1:
         rgb = rgb / 255.
